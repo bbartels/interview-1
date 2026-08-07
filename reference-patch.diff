@@ -1,0 +1,368 @@
+diff --git a/src/GPSTracker.Edge/HubRegistrationSession.cs b/src/GPSTracker.Edge/HubRegistrationSession.cs
+index dca6d55..bcea45a 100644
+--- a/src/GPSTracker.Edge/HubRegistrationSession.cs
++++ b/src/GPSTracker.Edge/HubRegistrationSession.cs
+@@ -5,28 +5,57 @@ namespace GPSTracker.Edge;
+ public sealed class HubRegistrationSession : IAsyncDisposable
+ {
+     private readonly IHubRegistrationClient _client;
++    private readonly IRemoteLocationHub _observer;
+     private readonly IRemoteLocationHub _reference;
+     private HubLease? _lease;
++    private bool _disposed;
+ 
+     public HubRegistrationSession(IHubRegistrationClient client, IRemoteLocationHub observer)
+     {
+         _client = client;
++        _observer = observer;
+         _reference = client.CreateReference(observer);
+     }
+ 
+     public async ValueTask StartAsync()
+     {
+-        _lease = await _client.RegisterAsync(_reference);
++        ObjectDisposedException.ThrowIf(_disposed, this);
++        _lease ??= await _client.RegisterAsync(_reference);
+     }
+ 
+     public async ValueTask RefreshAsync()
+     {
+-        _lease = await _client.RegisterAsync(_reference);
++        ObjectDisposedException.ThrowIf(_disposed, this);
++        if (_lease is null)
++        {
++            await StartAsync();
++            return;
++        }
++
++        if (!await _client.RefreshAsync(_lease, _reference))
++        {
++            _lease = await _client.RegisterAsync(_reference);
++        }
+     }
+ 
+-    public ValueTask DisposeAsync()
++    public async ValueTask DisposeAsync()
+     {
+-        _client.DeleteReference(_reference);
+-        return ValueTask.CompletedTask;
++        if (_disposed)
++        {
++            return;
++        }
++
++        _disposed = true;
++        try
++        {
++            if (_lease is not null)
++            {
++                await _client.UnregisterAsync(_lease);
++            }
++        }
++        finally
++        {
++            _client.DeleteReference(_reference);
++        }
+     }
+ }
+diff --git a/src/GPSTracker.Grains/DeviceGeofenceGrain.cs b/src/GPSTracker.Grains/DeviceGeofenceGrain.cs
+index 0c23089..5789c62 100644
+--- a/src/GPSTracker.Grains/DeviceGeofenceGrain.cs
++++ b/src/GPSTracker.Grains/DeviceGeofenceGrain.cs
+@@ -1,32 +1,47 @@
+ using GPSTracker.Contracts;
++using System.Text.RegularExpressions;
+ 
+ namespace GPSTracker.Grains;
+ 
+ public sealed class DeviceGeofenceGrain : Grain, IDeviceGeofenceGrain
+ {
++    private static readonly Regex ValidId = new("^[a-z0-9][a-z0-9-]{0,62}$", RegexOptions.CultureInvariant);
+     private GeofenceSnapshot? _snapshot;
+ 
+     public async ValueTask<GeofenceEvent?> ObserveAsync(
+         CircleGeofence geofence,
+         DeviceMessage location)
+     {
++        Validate(geofence, location);
++        if (_snapshot is { } snapshot)
++        {
++            if (snapshot.Geofence != geofence)
++            {
++                throw new InvalidOperationException("A device geofence definition cannot be replaced.");
++            }
++            if (location.UpdateId.CompareTo(snapshot.LastObserved.UpdateId) <= 0)
++            {
++                return null;
++            }
++        }
++
+         var isInside = GeoMath.DistanceMetres(
+             location,
+             location with
+             {
+                 Latitude = geofence.CenterLatitude,
+                 Longitude = geofence.CenterLongitude
+-            }) < geofence.RadiusMetres;
+-        var previousInside = _snapshot?.IsInside ?? false;
++            }) <= geofence.RadiusMetres;
++        var previousInside = _snapshot?.IsInside;
+         _snapshot = new GeofenceSnapshot(geofence, location, isInside);
+-        if (previousInside == isInside)
++        if (previousInside is null || previousInside == isInside)
+         {
+             return null;
+         }
+ 
+         var transition = isInside ? GeofenceTransition.Enter : GeofenceTransition.Exit;
+         var notification = new GeofenceEvent(
+-            Guid.NewGuid().ToString("N"),
++            GeofenceEventIds.Create(geofence.Id, location, transition),
+             geofence.Id,
+             transition,
+             location);
+@@ -37,4 +52,19 @@ public sealed class DeviceGeofenceGrain : Grain, IDeviceGeofenceGrain
+     }
+ 
+     public ValueTask<GeofenceSnapshot?> GetSnapshotAsync() => ValueTask.FromResult(_snapshot);
++
++    private void Validate(CircleGeofence geofence, DeviceMessage location)
++    {
++        if (location.DeviceId != this.GetPrimaryKeyLong())
++        {
++            throw new ArgumentException("Device ID does not match the grain key.", nameof(location));
++        }
++        if (!ValidId.IsMatch(geofence.Id) ||
++            !double.IsFinite(geofence.CenterLatitude) || geofence.CenterLatitude is < -90 or > 90 ||
++            !double.IsFinite(geofence.CenterLongitude) || geofence.CenterLongitude is < -180 or > 180 ||
++            !double.IsFinite(geofence.RadiusMetres) || geofence.RadiusMetres <= 0)
++        {
++            throw new ArgumentException("The geofence definition is invalid.", nameof(geofence));
++        }
++    }
+ }
+diff --git a/src/GPSTracker.Grains/DeviceGrain.cs b/src/GPSTracker.Grains/DeviceGrain.cs
+index d36c2eb..013f1d2 100644
+--- a/src/GPSTracker.Grains/DeviceGrain.cs
++++ b/src/GPSTracker.Grains/DeviceGrain.cs
+@@ -13,12 +13,22 @@ public sealed class DeviceGrain : Grain, IDeviceGrain
+ 
+     public async ValueTask<DeviceUpdateResult> ProcessMessageAsync(DeviceMessage message)
+     {
++        Validate(message);
+         var previous = _snapshot?.Message;
++        if (previous is not null)
++        {
++            if (message.UpdateId.CompareTo(previous.UpdateId) <= 0 ||
++                (message.UpdateId.Epoch == previous.UpdateId.Epoch && message.ObservedAt <= previous.ObservedAt))
++            {
++                return new DeviceUpdateResult(false, previous.UpdateId);
++            }
++        }
++
+         double? speed = null;
+         if (previous is not null && previous.UpdateId.Epoch == message.UpdateId.Epoch)
+         {
+             var seconds = (message.ObservedAt - previous.ObservedAt).TotalSeconds;
+-            speed = seconds == 0 ? 0 : GeoMath.DistanceMetres(previous, message) / seconds;
++            speed = GeoMath.DistanceMetres(previous, message) / seconds;
+         }
+ 
+         _snapshot = new DeviceSnapshot(message, speed);
+@@ -30,4 +40,32 @@ public sealed class DeviceGrain : Grain, IDeviceGrain
+     }
+ 
+     public ValueTask<DeviceSnapshot?> GetSnapshotAsync() => ValueTask.FromResult(_snapshot);
++
++    private void Validate(DeviceMessage message)
++    {
++        if (message.DeviceId != this.GetPrimaryKeyLong())
++        {
++            throw new ArgumentException("Device ID does not match the grain key.", nameof(message));
++        }
++
++        if (message.UpdateId.Epoch < 0 || message.UpdateId.Sequence <= 0)
++        {
++            throw new ArgumentOutOfRangeException(nameof(message), "Epoch must be non-negative and sequence positive.");
++        }
++
++        if (!double.IsFinite(message.Latitude) || message.Latitude is < -90 or > 90)
++        {
++            throw new ArgumentOutOfRangeException(nameof(message), "Latitude is outside its valid range.");
++        }
++
++        if (!double.IsFinite(message.Longitude) || message.Longitude is < -180 or > 180)
++        {
++            throw new ArgumentOutOfRangeException(nameof(message), "Longitude is outside its valid range.");
++        }
++
++        if (message.ObservedAt == default)
++        {
++            throw new ArgumentException("Observation time is required.", nameof(message));
++        }
++    }
+ }
+diff --git a/src/GPSTracker.Grains/GeoMath.cs b/src/GPSTracker.Grains/GeoMath.cs
+index 67c5f22..fecfae2 100644
+--- a/src/GPSTracker.Grains/GeoMath.cs
++++ b/src/GPSTracker.Grains/GeoMath.cs
+@@ -7,8 +7,20 @@ public static class GeoMath
+     public static double DistanceMetres(DeviceMessage first, DeviceMessage second)
+     {
+         const double EarthRadiusMetres = 6_371_008.8;
+-        var x = (second.Longitude - first.Longitude) * Math.Cos((second.Latitude + first.Latitude) / 2);
+-        var y = second.Latitude - first.Latitude;
+-        return Math.Sqrt((x * x) + (y * y)) * EarthRadiusMetres;
++        var firstLatitude = ToRadians(first.Latitude);
++        var secondLatitude = ToRadians(second.Latitude);
++        var latitudeDelta = secondLatitude - firstLatitude;
++        var longitudeDelta = Math.IEEERemainder(
++            ToRadians(second.Longitude - first.Longitude),
++            2 * Math.PI);
++        var sinLatitude = Math.Sin(latitudeDelta / 2);
++        var sinLongitude = Math.Sin(longitudeDelta / 2);
++        var haversine =
++            (sinLatitude * sinLatitude) +
++            (Math.Cos(firstLatitude) * Math.Cos(secondLatitude) * sinLongitude * sinLongitude);
++        haversine = Math.Clamp(haversine, 0, 1);
++        return 2 * EarthRadiusMetres * Math.Atan2(Math.Sqrt(haversine), Math.Sqrt(1 - haversine));
+     }
++
++    private static double ToRadians(double degrees) => degrees * Math.PI / 180;
+ }
+diff --git a/src/GPSTracker.Grains/HubListGrain.cs b/src/GPSTracker.Grains/HubListGrain.cs
+index 23f5c1a..6fbfbd1 100644
+--- a/src/GPSTracker.Grains/HubListGrain.cs
++++ b/src/GPSTracker.Grains/HubListGrain.cs
+@@ -20,7 +20,7 @@ public sealed class HubListGrain(IClusterMembershipService membership) : Grain,
+ 
+     public ValueTask<bool> RefreshHubAsync(HubLease lease, IRemoteLocationHub hub)
+     {
+-        if (!_registrations.ContainsKey(lease.Host))
++        if (!_registrations.TryGetValue(lease.Host, out var registration) || registration.Lease != lease)
+         {
+             return ValueTask.FromResult(false);
+         }
+@@ -29,12 +29,33 @@ public sealed class HubListGrain(IClusterMembershipService membership) : Grain,
+         return ValueTask.FromResult(true);
+     }
+ 
+-    public ValueTask<bool> UnregisterHubAsync(HubLease lease) =>
+-        ValueTask.FromResult(_registrations.Remove(lease.Host));
++    public ValueTask<bool> UnregisterHubAsync(HubLease lease)
++    {
++        if (!_registrations.TryGetValue(lease.Host, out var registration) || registration.Lease != lease)
++        {
++            return ValueTask.FromResult(false);
++        }
++
++        return ValueTask.FromResult(_registrations.Remove(lease.Host));
++    }
+ 
+     public ValueTask<ImmutableArray<HubRegistration>> GetActiveHubsAsync()
+     {
+-        _ = membership.CurrentSnapshot;
+-        return ValueTask.FromResult(_registrations.Values.ToImmutableArray());
++        var snapshot = membership.CurrentSnapshot;
++        var active = ImmutableArray.CreateBuilder<HubRegistration>();
++        foreach (var (host, registration) in _registrations.ToArray())
++        {
++            var status = snapshot.GetSiloStatus(host);
++            if (status == SiloStatus.Dead)
++            {
++                _registrations.Remove(host);
++            }
++            else if (status == SiloStatus.Active)
++            {
++                active.Add(registration);
++            }
++        }
++
++        return ValueTask.FromResult(active.ToImmutable());
+     }
+ }
+diff --git a/src/GPSTracker.Grains/PushNotifierGrain.cs b/src/GPSTracker.Grains/PushNotifierGrain.cs
+index 4155cc2..9bc4f7c 100644
+--- a/src/GPSTracker.Grains/PushNotifierGrain.cs
++++ b/src/GPSTracker.Grains/PushNotifierGrain.cs
+@@ -9,6 +9,7 @@ namespace GPSTracker.Grains;
+ public sealed class PushNotifierGrain(ILogger<PushNotifierGrain> logger) : Grain, IPushNotifierGrain
+ {
+     private readonly Queue<LocationUpdate> _queue = [];
++    private Task<FlushReport> _activeFlush = Task.FromResult(FlushReport.Empty);
+ 
+     public ValueTask EnqueueAsync(LocationUpdate update)
+     {
+@@ -16,27 +17,60 @@ public sealed class PushNotifierGrain(ILogger<PushNotifierGrain> logger) : Grain
+         return ValueTask.CompletedTask;
+     }
+ 
+-    public async ValueTask<FlushReport> FlushAsync()
++    public ValueTask<FlushReport> FlushAsync()
+     {
++        if (!_activeFlush.IsCompleted)
++        {
++            return new ValueTask<FlushReport>(_activeFlush);
++        }
++
+         if (_queue.Count == 0)
+         {
+-            return FlushReport.Empty;
++            return ValueTask.FromResult(FlushReport.Empty);
+         }
+ 
++        _activeFlush = FlushCoreAsync(_queue.Count);
++        return new ValueTask<FlushReport>(_activeFlush);
++    }
++
++    private async Task<FlushReport> FlushCoreAsync(int messageCount)
++    {
+         var directory = GrainFactory.GetGrain<IHubListGrain>(Guid.Empty);
+         var hubs = await directory.GetActiveHubsAsync();
+-        var updates = _queue.ToImmutableArray();
+-        _queue.Clear();
+-        var batch = new VelocityBatch(updates);
+-        var successful = 0;
+-
+-        foreach (var registration in hubs)
++        var updates = ImmutableArray.CreateBuilder<LocationUpdate>(messageCount);
++        for (var index = 0; index < messageCount; index++)
+         {
+-            await registration.Hub.BroadcastUpdatesAsync(batch);
+-            successful++;
++            updates.Add(_queue.Dequeue());
+         }
+ 
+-        logger.LogInformation("Flushed {MessageCount} messages to {HubCount} hubs", updates.Length, hubs.Length);
+-        return new FlushReport(updates.Length, 1, successful, 0);
++        var batches = 0;
++        var successful = 0;
++        var failed = 0;
++
++        foreach (var updatesBatch in updates.ToImmutable().Chunk(100))
++        {
++            batches++;
++            var batch = new VelocityBatch(updatesBatch.ToImmutableArray());
++            var deliveries = await Task.WhenAll(hubs.Select(registration => DeliverAsync(registration, batch)));
++            successful += deliveries.Count(delivered => delivered);
++            failed += deliveries.Count(delivered => !delivered);
++        }
++
++        logger.LogInformation("Flushed {MessageCount} messages in {BatchCount} batches", messageCount, batches);
++        return new FlushReport(messageCount, batches, successful, failed);
++    }
++
++    private async Task<bool> DeliverAsync(HubRegistration registration, VelocityBatch batch)
++    {
++        try
++        {
++            await registration.Hub.BroadcastUpdatesAsync(batch);
++            return true;
++        }
++        catch (Exception error)
++        {
++            logger.LogWarning(error, "Failed to deliver a location batch to {Host}", registration.Lease.Host);
++            return false;
++        }
+     }
+ }
